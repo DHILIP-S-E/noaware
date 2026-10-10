@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  NowAware Scheduled Backend - Personal AI Agent that monitors what matters
+  Architecture: EventBridge -> Lambda Worker -> DynamoDB, Bedrock, SES
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Deployment environment (dev, staging, prod)
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+    Description: Amazon Bedrock Foundation Model ID for change analysis
+
+  SesSenderEmail:
+    Type: String
+    Default: alerts@example.com
+    Description: Verified Amazon SES Sender Email for alert notifications
+
+  ScheduleInterval:
+    Type: String
+    Default: rate(5 minutes)
+    Description: EventBridge scheduled rule cadence
+
+Globals:
+  Function:
+    Timeout: 120
+    MemorySize: 512
+    Runtime: python3.11
+    Tracing: Active
+    Environment:
+      Variables:
+        NOWAWARE_MODE: aws
+        AWS_REGION_NAME: !Ref AWS::Region
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        SES_SENDER_EMAIL: !Ref SesSenderEmail
+        DYNAMODB_RULES_TABLE: !Ref MonitoringRulesTable
+        DYNAMODB_SNAPSHOTS_TABLE: !Ref SourceSnapshotsTable
+        DYNAMODB_ALERTS_TABLE: !Ref ChangeAlertsTable
+
+Resources:
+  # ==========================================
+  # DynamoDB Tables
+  # ==========================================
+  MonitoringRulesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub nowaware-monitoring-rules-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: owner_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OwnerIndex
+          KeySchema:
+            - AttributeName: owner_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  SourceSnapshotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub nowaware-source-snapshots-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: snapshot_id
+          AttributeType: S
+        - AttributeName: rule_id
+          AttributeType: S
+        - AttributeName: captured_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: snapshot_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: RuleCapturedIndex
+          KeySchema:
+            - AttributeName: rule_id
+              KeyType: HASH
+            - AttributeName: captured_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ChangeAlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub nowaware-change-alerts-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: rule_id
+          AttributeType: S
+        - AttributeName: detected_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: RuleAlertIndex
+          KeySchema:
+            - AttributeName: rule_id
+              KeyType: HASH
+            - AttributeName: detected_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ==========================================
+  # Scheduled Lambda Worker
+  # ==========================================
+  ScheduledMonitoringWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub nowaware-scheduled-worker-${EnvironmentName}
+      Handler: src.scheduling.worker.lambda_handler
+      CodeUri: .
+      Description: Periodically checks active sources, classifies changes, and dispatches SES alerts.
+      Policies:
+        # Least-privilege DynamoDB access
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MonitoringRulesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SourceSnapshotsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChangeAlertsTable
+        # Amazon Bedrock Invocation Policy
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
+        # Amazon SES Sending Policy
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+      Events:
+        ScheduledCheckCron:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleInterval
+            Name: !Sub nowaware-eventbridge-schedule-${EnvironmentName}
+            Description: Triggers NowAware monitoring worker every 5 minutes
+            Enabled: true
+
+Outputs:
+  MonitoringRulesTableName:
+    Description: DynamoDB Table for Monitoring Rules
+    Value: !Ref MonitoringRulesTable
+  SourceSnapshotsTableName:
+    Description: DynamoDB Table for Source Snapshots
+    Value: !Ref SourceSnapshotsTable
+  ChangeAlertsTableName:
+    Description: DynamoDB Table for Change Alerts
+    Value: !Ref ChangeAlertsTable
+  LambdaWorkerArn:
+    Description: ARN of the Scheduled Monitoring Worker Lambda
+    Value: !GetAtt ScheduledMonitoringWorker.Arn
