@@ -1,7 +1,11 @@
 """Change Classification Engine for NowAware."""
 
 import re
-from typing import List, Optional
+import json
+import logging
+from typing import List, Optional, Any
+import boto3
+from botocore.exceptions import ClientError
 from src.schemas.changes import (
     ClassificationType,
     ConfidenceLevel,
@@ -9,6 +13,9 @@ from src.schemas.changes import (
 )
 from src.schemas.monitoring import MonitoringRule
 from src.monitoring.diff_engine import DiffResult
+from src.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class ChangeClassifier:
@@ -245,3 +252,92 @@ class ChangeClassifier:
         if "feed" in goal_lower or "announcement" in goal_lower or "opportunity" in goal_lower:
             return "Inspect the new announcement posting to see if you qualify to apply."
         return "Review the source link and confirm the updated details."
+
+    @classmethod
+    def classify_with_bedrock(
+        cls,
+        rule: MonitoringRule,
+        diff_result: DiffResult,
+        source_url: str = "",
+        client: Optional[Any] = None,
+        model_id: Optional[str] = None,
+    ) -> ChangeAnalysisResult:
+        """
+        Classifies differences using Amazon Bedrock Foundation Models (Claude 3.5 Sonnet).
+        Falls back safely to deterministic heuristics on model failure, timeout, or invalid JSON.
+        """
+        if not diff_result.has_changed:
+            return cls.classify_diff(rule, diff_result, source_url)
+
+        model_id = model_id or settings.bedrock_model_id
+
+        # If no client provided, attempt to create if in AWS mode
+        if client is None:
+            if settings.is_aws_mode and settings.check_aws_credentials():
+                try:
+                    client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+                except Exception as e:
+                    logger.warning(f"Could not initialize Bedrock client: {e}. Falling back to heuristics.")
+                    return cls.classify_diff(rule, diff_result, source_url)
+            else:
+                # AWS credentials not configured; use verified heuristic engine
+                return cls.classify_diff(rule, diff_result, source_url)
+
+        prompt = (
+            f"You are NowAware, a strict change classifier that operates 'Quiet by Default'.\n"
+            f"User Goal: {rule.natural_language_goal}\n"
+            f"Criteria Categories: {', '.join(rule.criteria_categories)}\n"
+            f"Specific Instructions: {rule.specific_instructions or 'None'}\n\n"
+            f"Differences Detected:\n"
+            f"Added lines: {diff_result.added_lines}\n"
+            f"Removed lines: {diff_result.removed_lines}\n\n"
+            f"Respond ONLY in valid JSON matching this schema:\n"
+            f'{{"classification": "meaningful|irrelevant|uncertain", '
+            f'"summary": "Brief summary", '
+            f'"impact_explanation": "Why this matters to the user goal", '
+            f'"previous_value": "old value or null", '
+            f'"new_value": "new value or null", '
+            f'"should_notify": true|false, '
+            f'"confidence": "verified|high|medium|low"}}\n'
+        )
+
+        try:
+            # Format payload for Anthropic Claude messages API on Bedrock
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1000,
+                "temperature": 0.0,
+                "messages": [{"role": "user", "content": prompt}],
+            })
+
+            response = client.invoke_model(
+                modelId=model_id,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+            response_body = json.loads(response["body"].read().decode("utf-8"))
+            text_output = response_body.get("content", [{}])[0].get("text", "")
+            parsed = json.loads(text_output)
+
+            classification = ClassificationType(parsed.get("classification", "meaningful").lower())
+            confidence = ConfidenceLevel(parsed.get("confidence", "high").lower())
+
+            return ChangeAnalysisResult(
+                change_detected=True,
+                classification=classification,
+                summary=parsed.get("summary", "Change detected via Bedrock"),
+                previous_value=parsed.get("previous_value") or diff_result.isolated_previous,
+                new_value=parsed.get("new_value") or diff_result.isolated_new,
+                impact_explanation=parsed.get("impact_explanation", "Analyzed by Amazon Bedrock foundation model."),
+                evidence=diff_result.evidence_snippets[:5],
+                source_url=source_url,
+                confidence=confidence,
+                recommended_action=cls._recommend_action(rule, diff_result),
+                should_notify=bool(parsed.get("should_notify", classification == ClassificationType.MEANINGFUL)),
+            )
+        except (ClientError, json.JSONDecodeError, KeyError, Exception) as exc:
+            logger.warning(f"Bedrock invocation failed or returned invalid response: {exc}. Falling back to heuristics.")
+            fallback_res = cls.classify_diff(rule, diff_result, source_url)
+            fallback_res.impact_explanation += " (Bedrock fallback invoked)"
+            return fallback_res

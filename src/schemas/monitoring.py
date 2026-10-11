@@ -42,6 +42,8 @@ class MonitoringRule(BaseModel):
     error_message: Optional[str] = None
     consecutive_failures: int = 0
     is_demo_rule: bool = False
+    locked_until: Optional[str] = None
+    locked_by: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()

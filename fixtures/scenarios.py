@@ -214,4 +214,102 @@ DEMO_SCENARIOS = {
             "check_interval_minutes": 30,
         },
     },
+    "scenario_6_eligibility": {
+        "id": "scenario_6_eligibility",
+        "title": "Scenario 6: Meaningful Eligibility Criteria Change (GPA 3.5 -> 3.8)",
+        "description": "The foundation raises the minimum cumulative GPA requirement from 3.5 to 3.8. Directly impacts qualification.",
+        "expected_classification": "meaningful",
+        "should_notify": True,
+        "sample_url": "mock://foundation.org/scholarship",
+        "baseline_content": SCHOLARSHIP_BASELINE,
+        "updated_content": """<!DOCTYPE html>
+<html>
+<head><title>STEM Global Leadership Scholarship 2026</title></head>
+<body>
+  <h1>STEM Global Leadership Scholarship Program</h1>
+  <div class="card">
+    <h3>Eligibility Requirements</h3>
+    <ul>
+      <li>Undergraduate or graduate students in Computer Science or Mathematics.</li>
+      <li>Minimum cumulative GPA of 3.8 on a 4.0 scale.</li>
+      <li>Demonstrated leadership in university student organizations.</li>
+    </ul>
+    <h3>Important Dates</h3>
+    <p>Application Deadline: May 15, 2026 at 11:59 PM EST</p>
+    <p>Award Amount: $15,000 per recipient</p>
+  </div>
+  <footer>Copyright &copy; 2025 STEM Education Foundation.</footer>
+</body>
+</html>""",
+        "rule_template": {
+            "name": "STEM Scholarship Requirements",
+            "source_url": "mock://foundation.org/scholarship",
+            "source_type": SourceType.HTML,
+            "natural_language_goal": "Alert me if eligibility requirements or minimum GPA change.",
+            "criteria_categories": ["Eligibility or requirements"],
+            "specific_instructions": "gpa, minimum, eligibility, requirements",
+            "check_interval_minutes": 30,
+        },
+    },
+    "scenario_7_ambiguous": {
+        "id": "scenario_7_ambiguous",
+        "title": "Scenario 7: Ambiguous Policy Phrasing without Specific Values",
+        "description": "Vague mention of handbook schedule restructuring without explicit dates or fee values. Classified as UNCERTAIN, quiet by default.",
+        "expected_classification": "uncertain",
+        "should_notify": False,
+        "sample_url": "mock://university.edu/guidelines",
+        "baseline_content": "<h1>Student Guidelines</h1><p>General administrative policy remains standard.</p>",
+        "updated_content": "<h1>Student Guidelines</h1><p>General administrative policy: The academic council reserves the right to amend handbook timing and restructuring schedule as deemed necessary.</p>",
+        "rule_template": {
+            "name": "Academic Guidelines Monitor",
+            "source_url": "mock://university.edu/guidelines",
+            "source_type": SourceType.HTML,
+            "natural_language_goal": "Watch for substantive changes to calendar dates.",
+            "criteria_categories": ["Important dates and deadlines"],
+            "check_interval_minutes": 30,
+        },
+    },
+    "scenario_8_misleading": {
+        "id": "scenario_8_misleading",
+        "title": "Scenario 8: Misleading Ad / Promotional Content Injection",
+        "description": "An unrelated sponsored loan advertisement mentioning 'March 1 loan deadline' is injected into a sidebar, while the scholarship dates are unchanged. NowAware must not falsely trigger an alert on the scholarship.",
+        "expected_classification": "irrelevant",
+        "should_notify": False,
+        "sample_url": "mock://foundation.org/scholarship",
+        "baseline_content": SCHOLARSHIP_BASELINE,
+        "updated_content": """<!DOCTYPE html>
+<html>
+<head><title>STEM Global Leadership Scholarship 2026</title></head>
+<body>
+  <div class="sponsored-sidebar">
+    <p>Sponsored Promotion: Get Student Loans Today! Urgent deadline for loan discounts ends March 1!</p>
+  </div>
+  <div class="nav-bar">Home | About | Contact</div>
+  <h1>STEM Global Leadership Scholarship Program</h1>
+  <p class="announcement">Applications are currently accepted for the upcoming academic cycle.</p>
+  <div class="card">
+    <h3>Eligibility Requirements</h3>
+    <ul>
+      <li>Undergraduate or graduate students in Computer Science or Mathematics.</li>
+      <li>Minimum cumulative GPA of 3.5 on a 4.0 scale.</li>
+      <li>Demonstrated leadership in university student organizations.</li>
+    </ul>
+    <h3>Important Dates</h3>
+    <p>Application Deadline: May 15, 2026 at 11:59 PM EST</p>
+    <p>Award Amount: $15,000 per recipient</p>
+    <p>Award Announcement Date: July 1, 2026</p>
+  </div>
+  <footer>Copyright &copy; 2025 STEM Education Foundation. All rights reserved.</footer>
+</body>
+</html>""",
+        "rule_template": {
+            "name": "STEM Scholarship Deadline",
+            "source_url": "mock://foundation.org/scholarship",
+            "source_type": SourceType.HTML,
+            "natural_language_goal": "Watch this scholarship announcement and alert me if the application deadline changes.",
+            "criteria_categories": ["Important dates and deadlines"],
+            "specific_instructions": "application deadline",
+            "check_interval_minutes": 30,
+        },
+    },
 }

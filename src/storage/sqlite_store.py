@@ -1,10 +1,12 @@
-"""SQLite Storage Implementation for Local Dev and Demo Modes."""
+"""SQLite Storage Implementation with Authorization Boundaries and Atomic Concurrency Controls."""
 
 import sqlite3
 import json
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from src.storage.base import BaseStorage
+from datetime import datetime, timezone, timedelta
+
+from src.storage.base import BaseStorage, AuthorizationError
 from src.schemas.monitoring import MonitoringRule, SourceSnapshot, RuleStatus, SourceType
 from src.schemas.changes import ChangeEvent, ClassificationType, ConfidenceLevel
 
@@ -18,14 +20,17 @@ class SQLiteStorage(BaseStorage):
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=20.0)
         conn.row_factory = sqlite3.Row
+        # Enable WAL mode for high concurrency
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     def _init_db(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # Rules table
+            # Rules table with lock columns
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS monitoring_rules (
                     id TEXT PRIMARY KEY,
@@ -44,7 +49,9 @@ class SQLiteStorage(BaseStorage):
                     last_snapshot_id TEXT,
                     error_message TEXT,
                     consecutive_failures INTEGER DEFAULT 0,
-                    is_demo_rule INTEGER DEFAULT 0
+                    is_demo_rule INTEGER DEFAULT 0,
+                    locked_until TEXT,
+                    locked_by TEXT
                 )
             """)
 
@@ -62,7 +69,7 @@ class SQLiteStorage(BaseStorage):
                 )
             """)
 
-            # Change Events / Alerts table
+            # Change Events table with UNIQUE(rule_id, change_fingerprint) constraint
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS change_events (
                     event_id TEXT PRIMARY KEY,
@@ -83,6 +90,7 @@ class SQLiteStorage(BaseStorage):
                     notification_sent INTEGER NOT NULL,
                     read INTEGER DEFAULT 0,
                     dismissed INTEGER DEFAULT 0,
+                    UNIQUE(rule_id, change_fingerprint),
                     FOREIGN KEY(rule_id) REFERENCES monitoring_rules(id) ON DELETE CASCADE
                 )
             """)
@@ -92,6 +100,15 @@ class SQLiteStorage(BaseStorage):
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_rule ON source_snapshots(rule_id, captured_at DESC)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_rule ON change_events(rule_id, detected_at DESC)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_fingerprint ON change_events(rule_id, change_fingerprint)")
+
+            # Automatic column migration for existing databases
+            cursor.execute("PRAGMA table_info(monitoring_rules)")
+            existing_cols = {col[1] for col in cursor.fetchall()}
+            if "locked_until" not in existing_cols:
+                cursor.execute("ALTER TABLE monitoring_rules ADD COLUMN locked_until TEXT")
+            if "locked_by" not in existing_cols:
+                cursor.execute("ALTER TABLE monitoring_rules ADD COLUMN locked_by TEXT")
+
             conn.commit()
 
     def save_rule(self, rule: MonitoringRule) -> None:
@@ -103,8 +120,8 @@ class SQLiteStorage(BaseStorage):
                     natural_language_goal, criteria_categories, specific_instructions,
                     check_interval_minutes, status, created_at, last_checked_at,
                     next_check_at, last_snapshot_id, error_message, consecutive_failures,
-                    is_demo_rule
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_demo_rule, locked_until, locked_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 rule.id,
                 rule.owner_id,
@@ -123,34 +140,84 @@ class SQLiteStorage(BaseStorage):
                 rule.error_message,
                 rule.consecutive_failures,
                 1 if rule.is_demo_rule else 0,
+                rule.locked_until,
+                rule.locked_by,
             ))
             conn.commit()
 
-    def get_rule(self, rule_id: str) -> Optional[MonitoringRule]:
+    def get_rule(self, rule_id: str, owner_id: Optional[str] = None) -> Optional[MonitoringRule]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM monitoring_rules WHERE id = ?", (rule_id,))
             row = cursor.fetchone()
             if not row:
                 return None
-            return self._row_to_rule(row)
+            rule = self._row_to_rule(row)
+            if owner_id and rule.owner_id != owner_id:
+                raise AuthorizationError(
+                    f"Access denied: user '{owner_id}' does not own rule '{rule_id}'."
+                )
+            return rule
 
-    def list_rules(self, owner_id: str = "default-user") -> List[MonitoringRule]:
+    def list_rules(self, owner_id: Optional[str] = None) -> List[MonitoringRule]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM monitoring_rules WHERE owner_id = ? ORDER BY created_at DESC", (owner_id,))
+            if owner_id:
+                cursor.execute(
+                    "SELECT * FROM monitoring_rules WHERE owner_id = ? ORDER BY created_at DESC",
+                    (owner_id,),
+                )
+            else:
+                cursor.execute("SELECT * FROM monitoring_rules ORDER BY created_at DESC")
             rows = cursor.fetchall()
             return [self._row_to_rule(r) for r in rows]
 
-    def update_rule(self, rule: MonitoringRule) -> None:
+    def update_rule(self, rule: MonitoringRule, owner_id: Optional[str] = None) -> None:
+        if owner_id:
+            existing = self.get_rule(rule.id, owner_id=owner_id)
+            if not existing:
+                raise AuthorizationError(f"Rule '{rule.id}' not found for user '{owner_id}'.")
+            if rule.owner_id != owner_id:
+                raise AuthorizationError("Cannot reassign rule owner_id.")
         self.save_rule(rule)
 
-    def delete_rule(self, rule_id: str) -> None:
+    def delete_rule(self, rule_id: str, owner_id: Optional[str] = None) -> None:
+        if owner_id:
+            existing = self.get_rule(rule_id, owner_id=owner_id)
+            if not existing:
+                raise AuthorizationError(f"Rule '{rule_id}' not found for user '{owner_id}'.")
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM change_events WHERE rule_id = ?", (rule_id,))
             cursor.execute("DELETE FROM source_snapshots WHERE rule_id = ?", (rule_id,))
             cursor.execute("DELETE FROM monitoring_rules WHERE id = ?", (rule_id,))
+            conn.commit()
+
+    def claim_rule_lock(self, rule_id: str, worker_id: str, lease_seconds: int = 60) -> bool:
+        """Atomically claims lease lock on rule in SQLite using atomic UPDATE with lock expiry."""
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE monitoring_rules
+                SET locked_until = ?, locked_by = ?
+                WHERE id = ? AND (locked_until IS NULL OR locked_until < ?)
+            """, (lease_until, worker_id, rule_id, now_iso))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def release_rule_lock(self, rule_id: str, worker_id: str) -> None:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE monitoring_rules
+                SET locked_until = NULL, locked_by = NULL
+                WHERE id = ? AND locked_by = ?
+            """, (rule_id, worker_id))
             conn.commit()
 
     def save_snapshot(self, snapshot: SourceSnapshot) -> None:
@@ -196,84 +263,118 @@ class SQLiteStorage(BaseStorage):
             rows = cursor.fetchall()
             return [self._row_to_snapshot(r) for r in rows]
 
-    def save_change_event(self, event: ChangeEvent) -> None:
+    def save_change_event(self, event: ChangeEvent) -> bool:
+        """
+        Atomically saves change event. Returns True if inserted, False if duplicate rejected.
+        Enforces UNIQUE(rule_id, change_fingerprint).
+        """
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO change_events (
-                    event_id, rule_id, rule_name, detected_at, change_fingerprint,
-                    classification, summary, previous_value, new_value,
-                    impact_explanation, evidence_json, source_url, confidence,
-                    recommended_action, should_notify, notification_sent,
-                    read, dismissed
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                event.event_id,
-                event.rule_id,
-                event.rule_name,
-                event.detected_at,
-                event.change_fingerprint,
-                event.classification.value,
-                event.summary,
-                event.previous_value,
-                event.new_value,
-                event.impact_explanation,
-                json.dumps(event.evidence),
-                event.source_url,
-                event.confidence.value,
-                event.recommended_action,
-                1 if event.should_notify else 0,
-                1 if event.notification_sent else 0,
-                1 if event.read else 0,
-                1 if event.dismissed else 0,
-            ))
-            conn.commit()
+            try:
+                cursor.execute("""
+                    INSERT INTO change_events (
+                        event_id, rule_id, rule_name, detected_at, change_fingerprint,
+                        classification, summary, previous_value, new_value,
+                        impact_explanation, evidence_json, source_url, confidence,
+                        recommended_action, should_notify, notification_sent,
+                        read, dismissed
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    event.event_id,
+                    event.rule_id,
+                    event.rule_name,
+                    event.detected_at,
+                    event.change_fingerprint,
+                    event.classification.value,
+                    event.summary,
+                    event.previous_value,
+                    event.new_value,
+                    event.impact_explanation,
+                    json.dumps(event.evidence),
+                    event.source_url,
+                    event.confidence.value,
+                    event.recommended_action,
+                    1 if event.should_notify else 0,
+                    1 if event.notification_sent else 0,
+                    1 if event.read else 0,
+                    1 if event.dismissed else 0,
+                ))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                # Concurrent or duplicate event with matching (rule_id, change_fingerprint)
+                return False
 
     def list_change_events(
         self,
         rule_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
         only_unread: bool = False,
         limit: int = 50,
     ) -> List[ChangeEvent]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            query = "SELECT * FROM change_events WHERE dismissed = 0"
-            params = []
+            query = """
+                SELECT e.* FROM change_events e
+                JOIN monitoring_rules r ON e.rule_id = r.id
+                WHERE e.dismissed = 0
+            """
+            params: List[Any] = []
             if rule_id:
-                query += " AND rule_id = ?"
+                query += " AND e.rule_id = ?"
                 params.append(rule_id)
+            if owner_id:
+                query += " AND r.owner_id = ?"
+                params.append(owner_id)
             if only_unread:
-                query += " AND read = 0"
-            query += " ORDER BY detected_at DESC LIMIT ?"
+                query += " AND e.read = 0"
+
+            query += " ORDER BY e.detected_at DESC LIMIT ?"
             params.append(limit)
 
             cursor.execute(query, tuple(params))
             rows = cursor.fetchall()
             return [self._row_to_event(r) for r in rows]
 
-    def get_change_event(self, event_id: str) -> Optional[ChangeEvent]:
+    def get_change_event(self, event_id: str, owner_id: Optional[str] = None) -> Optional[ChangeEvent]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM change_events WHERE event_id = ?", (event_id,))
+            if owner_id:
+                cursor.execute("""
+                    SELECT e.* FROM change_events e
+                    JOIN monitoring_rules r ON e.rule_id = r.id
+                    WHERE e.event_id = ? AND r.owner_id = ?
+                """, (event_id, owner_id))
+            else:
+                cursor.execute("SELECT * FROM change_events WHERE event_id = ?", (event_id,))
             row = cursor.fetchone()
             if not row:
                 return None
             return self._row_to_event(row)
 
-    def mark_event_read(self, event_id: str, read: bool = True) -> None:
+    def mark_event_read(self, event_id: str, read: bool = True, owner_id: Optional[str] = None) -> None:
+        if owner_id:
+            ev = self.get_change_event(event_id, owner_id=owner_id)
+            if not ev:
+                raise AuthorizationError(f"Event '{event_id}' does not belong to user '{owner_id}'.")
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE change_events SET read = ? WHERE event_id = ?", (1 if read else 0, event_id))
             conn.commit()
 
-    def dismiss_event(self, event_id: str) -> None:
+    def dismiss_event(self, event_id: str, owner_id: Optional[str] = None) -> None:
+        if owner_id:
+            ev = self.get_change_event(event_id, owner_id=owner_id)
+            if not ev:
+                raise AuthorizationError(f"Event '{event_id}' does not belong to user '{owner_id}'.")
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE change_events SET dismissed = 1 WHERE event_id = ?", (event_id,))
             conn.commit()
 
     def is_duplicate_event(self, rule_id: str, change_fingerprint: str) -> bool:
-        """Returns True if the exact same change fingerprint already exists for this rule."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -283,20 +384,41 @@ class SQLiteStorage(BaseStorage):
             """, (rule_id, change_fingerprint))
             return cursor.fetchone() is not None
 
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self, owner_id: Optional[str] = None) -> Dict[str, int]:
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM monitoring_rules WHERE status = 'active'")
-            active_rules = cursor.fetchone()[0]
+            if owner_id:
+                cursor.execute("SELECT COUNT(*) FROM monitoring_rules WHERE status = 'active' AND owner_id = ?", (owner_id,))
+                active_rules = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM change_events WHERE classification = 'meaningful'")
-            meaningful_changes = cursor.fetchone()[0]
+                cursor.execute("""
+                    SELECT COUNT(*) FROM change_events e
+                    JOIN monitoring_rules r ON e.rule_id = r.id
+                    WHERE e.classification = 'meaningful' AND r.owner_id = ?
+                """, (owner_id,))
+                meaningful_changes = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM change_events WHERE read = 0 AND should_notify = 1 AND dismissed = 0")
-            unread_alerts = cursor.fetchone()[0]
+                cursor.execute("""
+                    SELECT COUNT(*) FROM change_events e
+                    JOIN monitoring_rules r ON e.rule_id = r.id
+                    WHERE e.read = 0 AND e.should_notify = 1 AND e.dismissed = 0 AND r.owner_id = ?
+                """, (owner_id,))
+                unread_alerts = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM monitoring_rules WHERE status = 'error'")
-            needing_attention = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM monitoring_rules WHERE status = 'error' AND owner_id = ?", (owner_id,))
+                needing_attention = cursor.fetchone()[0]
+            else:
+                cursor.execute("SELECT COUNT(*) FROM monitoring_rules WHERE status = 'active'")
+                active_rules = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM change_events WHERE classification = 'meaningful'")
+                meaningful_changes = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM change_events WHERE read = 0 AND should_notify = 1 AND dismissed = 0")
+                unread_alerts = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM monitoring_rules WHERE status = 'error'")
+                needing_attention = cursor.fetchone()[0]
 
             return {
                 "active_rules": active_rules,
@@ -325,6 +447,8 @@ class SQLiteStorage(BaseStorage):
             error_message=row["error_message"],
             consecutive_failures=row["consecutive_failures"],
             is_demo_rule=bool(row["is_demo_rule"]),
+            locked_until=row["locked_until"] if "locked_until" in row.keys() else None,
+            locked_by=row["locked_by"] if "locked_by" in row.keys() else None,
         )
 
     @staticmethod

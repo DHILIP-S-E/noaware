@@ -17,18 +17,24 @@ from src.schemas.changes import (
     ClassificationType,
     ConfidenceLevel,
 )
-from src.storage.base import BaseStorage
+from src.storage.base import BaseStorage, AuthorizationError
 
 # Storage reference set dynamically or by factory
 _active_storage: Optional[BaseStorage] = None
 _active_fetcher: Optional[SourceFetcher] = None
+_active_owner_id: str = "default-user"
 
 
-def set_global_context(storage: BaseStorage, fetcher: SourceFetcher):
-    """Sets active storage and fetcher dependencies for agent tools."""
-    global _active_storage, _active_fetcher
+def set_global_context(storage: BaseStorage, fetcher: SourceFetcher, owner_id: str = "default-user"):
+    """Sets active storage, fetcher, and tenant owner dependencies for agent tools."""
+    global _active_storage, _active_fetcher, _active_owner_id
     _active_storage = storage
     _active_fetcher = fetcher
+    _active_owner_id = owner_id
+
+
+def get_owner_id() -> str:
+    return _active_owner_id
 
 
 def get_storage() -> BaseStorage:
@@ -94,6 +100,7 @@ def create_monitoring_rule(
     rule = MonitoringRule(
         name=name,
         source_url=source_url,
+        owner_id=get_owner_id(),
         natural_language_goal=natural_language_goal,
         criteria_categories=criteria_categories,
         specific_instructions=specific_instructions,
@@ -132,7 +139,10 @@ def get_monitoring_rule(rule_id: str) -> str:
     Retrieves configuration and current status of an existing monitoring rule by ID.
     """
     storage = get_storage()
-    rule = storage.get_rule(rule_id)
+    try:
+        rule = storage.get_rule(rule_id, owner_id=get_owner_id())
+    except AuthorizationError as e:
+        return f"Authorization error: {e}"
     if not rule:
         return f"Monitoring rule with ID '{rule_id}' not found."
     return json.dumps(rule.to_dict(), indent=2)
@@ -272,11 +282,14 @@ def prepare_alert(
 def pause_monitor(rule_id: str) -> str:
     """Pauses scheduled checks for a monitor."""
     storage = get_storage()
-    rule = storage.get_rule(rule_id)
+    try:
+        rule = storage.get_rule(rule_id, owner_id=get_owner_id())
+    except AuthorizationError as e:
+        return f"Authorization error: {e}"
     if not rule:
         return f"Rule {rule_id} not found."
     rule.status = RuleStatus.PAUSED
-    storage.update_rule(rule)
+    storage.update_rule(rule, owner_id=get_owner_id())
     return f"Monitor '{rule.name}' has been paused."
 
 
@@ -290,7 +303,10 @@ def update_monitor(
 ) -> str:
     """Updates parameters of an existing monitoring rule."""
     storage = get_storage()
-    rule = storage.get_rule(rule_id)
+    try:
+        rule = storage.get_rule(rule_id, owner_id=get_owner_id())
+    except AuthorizationError as e:
+        return f"Authorization error: {e}"
     if not rule:
         return f"Rule {rule_id} not found."
 
@@ -303,7 +319,7 @@ def update_monitor(
     if check_interval_minutes:
         rule.check_interval_minutes = max(5, check_interval_minutes)
 
-    storage.update_rule(rule)
+    storage.update_rule(rule, owner_id=get_owner_id())
     return f"Monitor '{rule.name}' updated successfully."
 
 

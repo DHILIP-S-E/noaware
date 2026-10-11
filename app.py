@@ -217,36 +217,63 @@ if "seeded" not in st.session_state:
                 specific_instructions=template.get("specific_instructions", ""),
                 check_interval_minutes=template["check_interval_minutes"],
                 is_demo_rule=True,
+                owner_id="user-alice",
             )
             service.storage.save_rule(rule)
             try:
-                service.establish_baseline(rule)
+                service.establish_baseline(rule, owner_id="user-alice")
             except Exception:
                 pass
     st.session_state["seeded"] = True
 
 
 # ---------------------------------------------------------
-# Top Navigation & Mode Indicator
+# Top Navigation, Tenant Authentication & Mode Indicator
 # ---------------------------------------------------------
-stats = service.storage.get_stats()
-unread_count = stats.get("unread_alerts", 0)
-
 with st.sidebar:
     st.markdown("## 👁️ **NowAware**")
     st.caption("Personal AI Agent That Notices What Matters")
 
-    # Mode Badge
-    if settings.is_aws_mode:
+    # Authentication & Tenant Boundary Resolution
+    from src.security.auth import resolve_request_identity
+    if not settings.is_aws_mode:
         st.markdown(
-            '<div class="badge-meaningful" style="margin-bottom: 12px;">☁️ AWS MODE (Bedrock + DynamoDB)</div>',
+            '<div class="badge-irrelevant" style="margin-bottom: 8px;">💻 LOCAL DEMO MODE (SQLite)</div>',
             unsafe_allow_html=True,
+        )
+        st.caption("🔒 **Simulated Multi-Tenant Testing Only**")
+        current_user = st.selectbox(
+            "DEMO ONLY: Select Simulated Tenant:",
+            options=["user-alice", "user-bob", "default-user"],
+            index=0,
+            help="Simulates independent tenant contexts strictly for local offline demonstration and evaluation.",
         )
     else:
+        # AWS-backed mode: never trust frontend-supplied tenant parameter
         st.markdown(
-            '<div class="badge-irrelevant" style="margin-bottom: 12px;">💻 LOCAL DEMO MODE (SQLite)</div>',
+            '<div class="badge-meaningful" style="margin-bottom: 8px;">☁️ AWS MODE (Bedrock + DynamoDB)</div>',
             unsafe_allow_html=True,
         )
+        cloud_user, is_verified, auth_status = resolve_request_identity()
+        if is_verified and cloud_user:
+            st.success(f"Verified Cloud Principal: `{cloud_user}`")
+            current_user = cloud_user
+        else:
+            st.error("⚠️ Multi-User Cloud Access Disabled")
+            st.caption(
+                "Frontend tenant-switching is strictly prohibited in AWS mode. "
+                "No verified Identity Provider (Cognito / ALB OIDC) detected."
+            )
+            current_user = None
+
+    if current_user:
+        from src.agent.tools import set_global_context
+        set_global_context(service.storage, service.fetcher, owner_id=current_user)
+        stats = service.storage.get_stats(owner_id=current_user)
+        unread_count = stats.get("unread_alerts", 0)
+    else:
+        stats = {}
+        unread_count = 0
 
     menu_options = [
         "Dashboard",
@@ -285,6 +312,20 @@ with st.sidebar:
     )
 
 page = st.session_state["selected_page"]
+
+# Hard security boundary for unauthenticated cloud mode
+if current_user is None:
+    st.error("### 🔒 Multi-User Cloud Access Disabled")
+    st.warning(
+        "NowAware is running in AWS Cloud Mode, but no verified enterprise identity "
+        "(such as AWS Cognito or ALB OIDC authentication headers) was detected.\n\n"
+        "To prevent unauthorized tenant spoofing, frontend tenant selection is prohibited in cloud mode.\n\n"
+        "**Required Actions:**\n"
+        "- Connect an authorized Identity Provider (Cognito / ALB OIDC) setting `x-amzn-oidc-identity`, or\n"
+        "- Configure `VERIFIED_CLOUD_USER_ID` or IAM environment credentials, or\n"
+        "- Switch back to Local Demo Mode (`NOWAWARE_MODE=local`) for standalone testing."
+    )
+    st.stop()
 
 
 # =========================================================
@@ -349,19 +390,19 @@ if page == "Dashboard":
 
     st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
 
-    # Active Monitors List
-    st.subheader("Your Monitored Sources")
-    rules = service.storage.list_rules()
+    # Active Monitors List (Scoped to active tenant user)
+    st.subheader(f"Monitored Sources ({current_user})")
+    rules = service.storage.list_rules(owner_id=current_user)
 
     if not rules:
-        st.info("No active monitors yet. Tell NowAware what you would like to watch above or click 'Create Monitor' to begin.")
+        st.info(f"No active monitors for '{current_user}'. Tell NowAware what you would like to watch above or click 'Create Monitor' to begin.")
     else:
         for rule in rules:
-            rule_alerts = service.storage.list_change_events(rule_id=rule.id, only_unread=True)
+            rule_alerts = service.storage.list_change_events(rule_id=rule.id, owner_id=current_user, only_unread=True)
             unread_for_rule = len(rule_alerts)
 
             with st.container():
-                st.markdown(f"""
+                st.html(f"""
                 <div class="nowaware-card">
                     <div style="display: flex; justify-content: space-between; align-items: flex-start;">
                         <div>
@@ -374,7 +415,7 @@ if page == "Dashboard":
                         </div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
 
                 c_info1, c_info2, c_btn1, c_btn2, c_btn3, c_btn4 = st.columns([3, 3, 1.5, 1.5, 1.5, 1.2])
                 with c_info1:
@@ -387,7 +428,7 @@ if page == "Dashboard":
                 with c_btn1:
                     if st.button("Check Now", key=f"check_{rule.id}", use_container_width=True):
                         with st.spinner("Checking source..."):
-                            has_changed, event, msg = service.check_rule(rule.id)
+                            has_changed, event, msg = service.check_rule(rule.id, owner_id=current_user)
                             if has_changed and event:
                                 st.success(f"Change detected: {event.summary}")
                             elif has_changed and not event:
@@ -406,17 +447,17 @@ if page == "Dashboard":
                     if rule.status == RuleStatus.ACTIVE:
                         if st.button("Pause", key=f"pause_{rule.id}", use_container_width=True):
                             rule.status = RuleStatus.PAUSED
-                            service.storage.update_rule(rule)
+                            service.storage.update_rule(rule, owner_id=current_user)
                             st.rerun()
                     else:
                         if st.button("Resume", key=f"resume_{rule.id}", use_container_width=True):
                             rule.status = RuleStatus.ACTIVE
-                            service.storage.update_rule(rule)
+                            service.storage.update_rule(rule, owner_id=current_user)
                             st.rerun()
 
                 with c_btn4:
                     if st.button("Delete", key=f"del_{rule.id}", use_container_width=True):
-                        service.storage.delete_rule(rule.id)
+                        service.storage.delete_rule(rule.id, owner_id=current_user)
                         st.rerun()
 
                 st.markdown("<hr style='border-color: rgba(255,255,255,0.05); margin: 8px 0;'>", unsafe_allow_html=True)
@@ -563,6 +604,7 @@ elif page == "Create Monitor":
                     rule = MonitoringRule(
                         name=proposed_name,
                         source_url=url_input,
+                        owner_id=current_user,
                         source_type=SourceType.RSS if "feed" in url_input.lower() or "xml" in url_input.lower() else SourceType.HTML,
                         natural_language_goal=goal_input,
                         criteria_categories=chosen_categories,
@@ -571,8 +613,8 @@ elif page == "Create Monitor":
                         status=RuleStatus.ACTIVE,
                     )
                     service.storage.save_rule(rule)
-                    service.establish_baseline(rule)
-                    st.success(f"Monitor '{rule.name}' successfully activated!")
+                    service.establish_baseline(rule, owner_id=current_user)
+                    st.success(f"Monitor '{rule.name}' successfully activated for {current_user}!")
                     st.session_state["selected_page"] = "Dashboard"
                     st.rerun()
                 except Exception as e:
@@ -585,9 +627,9 @@ elif page == "Create Monitor":
 elif page == "Monitor Details":
     st.title("Monitor Details & Inspection")
 
-    rules = service.storage.list_rules()
+    rules = service.storage.list_rules(owner_id=current_user)
     if not rules:
-        st.info("No monitors configured yet.")
+        st.info(f"No monitors configured for user '{current_user}'.")
     else:
         # Selector
         rule_map = {f"{r.name} ({r.source_url[:30]}...)": r.id for r in rules}
@@ -602,29 +644,29 @@ elif page == "Monitor Details":
 
         chosen_key = st.selectbox("Select Monitor to inspect:", options=keys, index=current_idx)
         rule_id = rule_map[chosen_key]
-        rule = service.storage.get_rule(rule_id)
+        rule = service.storage.get_rule(rule_id, owner_id=current_user)
 
         if rule:
             # Monitor Header Card
-            st.markdown(f"""
+            st.html(f"""
             <div class="nowaware-card">
                 <div style="display: flex; justify-content: space-between;">
                     <div>
                         <h2>{rule.name}</h2>
                         <span class="badge-{rule.status.value}">{rule.status.value.upper()}</span>
                         <p style="margin-top: 8px; color: #cbd5e1;">🎯 <b>Monitoring Goal:</b> {rule.natural_language_goal}</p>
-                        <p style="color: #64748b;">🔗 <b>Source URL:</b> <code>{rule.source_url}</code></p>
+                        <p style="color: #64748b;">🔗 <b>Source URL:</b> <code>{rule.source_url}</code> | <b>Owner:</b> <code>{rule.owner_id}</code></p>
                     </div>
                 </div>
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
             # Action buttons
             c_btn_a, c_btn_b, c_btn_c = st.columns(3)
             with c_btn_a:
                 if st.button("Check Source Now", type="primary", use_container_width=True):
                     with st.spinner("Checking source..."):
-                        has_changed, event, msg = service.check_rule(rule.id)
+                        has_changed, event, msg = service.check_rule(rule.id, owner_id=current_user)
                         if has_changed and event:
                             st.success(f"Change detected: {event.summary}")
                         elif has_changed and not event:
@@ -637,17 +679,17 @@ elif page == "Monitor Details":
                 if rule.status == RuleStatus.ACTIVE:
                     if st.button("Pause Scheduled Checks", use_container_width=True):
                         rule.status = RuleStatus.PAUSED
-                        service.storage.update_rule(rule)
+                        service.storage.update_rule(rule, owner_id=current_user)
                         st.rerun()
                 else:
                     if st.button("Resume Scheduled Checks", use_container_width=True):
                         rule.status = RuleStatus.ACTIVE
-                        service.storage.update_rule(rule)
+                        service.storage.update_rule(rule, owner_id=current_user)
                         st.rerun()
 
             with c_btn_c:
                 if st.button("Delete Monitor", use_container_width=True):
-                    service.storage.delete_rule(rule.id)
+                    service.storage.delete_rule(rule.id, owner_id=current_user)
                     st.session_state["selected_page"] = "Dashboard"
                     st.rerun()
 
@@ -674,13 +716,13 @@ elif page == "Monitor Details":
                     st.warning("No baseline snapshot captured yet.")
 
             with tab_alerts:
-                events = service.storage.list_change_events(rule_id=rule.id)
+                events = service.storage.list_change_events(rule_id=rule.id, owner_id=current_user)
                 if not events:
                     st.info("No change alerts recorded for this monitor yet.")
                 else:
                     for ev in events:
                         badge_class = f"badge-{ev.classification.value}"
-                        st.markdown(f"""
+                        st.html(f"""
                         <div class="nowaware-card">
                             <span class="{badge_class}">{ev.classification.value.upper()}</span>
                             &nbsp;
@@ -689,7 +731,7 @@ elif page == "Monitor Details":
                             <p style="color: #cbd5e1; font-size: 14px;">{ev.impact_explanation}</p>
                             {f'<div class="compare-box"><div class="compare-old">- {ev.previous_value}</div><div class="compare-new">+ {ev.new_value}</div></div>' if ev.previous_value or ev.new_value else ''}
                         </div>
-                        """, unsafe_allow_html=True)
+                        """)
 
             with tab_simulate:
                 st.markdown("#### Simulate Source Updates")
@@ -711,7 +753,7 @@ elif page == "Monitor Details":
 
                 if st.button("Apply Simulated Check ⚡", type="primary"):
                     with st.spinner("Processing simulated check through classification engine..."):
-                        has_changed, event, msg = service.check_rule(rule.id, simulated_content=sim_content)
+                        has_changed, event, msg = service.check_rule(rule.id, simulated_content=sim_content, owner_id=current_user)
                         if has_changed and event:
                             st.success(f"Change classified as: {event.classification.value.upper()}! Alert generated.")
                         elif has_changed and not event:
@@ -726,9 +768,9 @@ elif page == "Monitor Details":
 # =========================================================
 elif page == "Alert Inbox":
     st.title("Alert Inbox")
-    st.markdown("Evidence-backed changes detected by your personal monitoring agent. 'Quiet by Default' ensures only meaningful changes notify you.")
+    st.markdown(f"Evidence-backed changes detected for **{current_user}**. 'Quiet by Default' ensures only meaningful changes notify you.")
 
-    all_events = service.storage.list_change_events(limit=50)
+    all_events = service.storage.list_change_events(owner_id=current_user, limit=50)
 
     # Filter chips
     f_col1, f_col2, f_col3 = st.columns([2, 2, 2])
@@ -739,7 +781,7 @@ elif page == "Alert Inbox":
     with f_col3:
         if st.button("Mark All as Read", use_container_width=True):
             for ev in all_events:
-                service.storage.mark_event_read(ev.event_id, True)
+                service.storage.mark_event_read(ev.event_id, True, owner_id=current_user)
             st.rerun()
 
     filtered = []
@@ -757,8 +799,20 @@ elif page == "Alert Inbox":
             badge_class = f"badge-{ev.classification.value}"
             read_indicator = "🔵 UNREAD" if not ev.read else "✓ READ"
 
-            st.markdown(f"""
-            <div class="nowaware-card" style="border-left: 4px solid {'#f59e0b' if ev.classification == ClassificationType.MEANINGFUL else '#38bdf8'};">
+            compare_html = ""
+            if ev.previous_value or ev.new_value:
+                prev_val = ev.previous_value or 'N/A'
+                new_val = ev.new_value or 'N/A'
+                compare_html = f"""<div class="compare-box" style="margin-bottom: 12px;"><div class="compare-old">Previous: {prev_val}</div><div class="compare-new">Updated:  {new_val}</div></div>"""
+
+            evidence_html = ""
+            if ev.evidence:
+                quotes_html = "".join([f"<div class='evidence-quote'>“{q}”</div>" for q in ev.evidence[:3]])
+                evidence_html = f"<div style='margin-bottom: 12px;'><b style='font-size: 13px; color: #94a3b8;'>Direct Source Evidence:</b>{quotes_html}</div>"
+
+            card_border = '#f59e0b' if ev.classification == ClassificationType.MEANINGFUL else '#38bdf8'
+            st.html(f"""
+            <div class="nowaware-card" style="border-left: 4px solid {card_border};">
                 <div style="display: flex; justify-content: space-between;">
                     <div>
                         <span class="{badge_class}">{ev.classification.value.upper()}</span>
@@ -773,42 +827,29 @@ elif page == "Alert Inbox":
                     <div style="color: #cbd5e1; font-size: 14px; margin-bottom: 10px;">
                         <b>Why this matters:</b> {ev.impact_explanation}
                     </div>
-            """, unsafe_allow_html=True)
-
-            if ev.previous_value or ev.new_value:
-                st.markdown(f"""
-                <div class="compare-box" style="margin-bottom: 12px;">
-                    <div class="compare-old">Previous: {ev.previous_value or 'N/A'}</div>
-                    <div class="compare-new">Updated:  {ev.new_value or 'N/A'}</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            if ev.evidence:
-                st.markdown("<b style='font-size: 13px; color: #94a3b8;'>Direct Source Evidence:</b>", unsafe_allow_html=True)
-                for quote in ev.evidence[:3]:
-                    st.markdown(f"<div class='evidence-quote'>“{quote}”</div>", unsafe_allow_html=True)
-
-            st.markdown(f"""
-                <div style="margin-top: 12px; color: #38bdf8; font-size: 13px;">
-                    💡 <b>Suggested Next Action:</b> {ev.recommended_action}
+                    {compare_html}
+                    {evidence_html}
+                    <div style="margin-top: 12px; color: #38bdf8; font-size: 13px;">
+                        💡 <b>Suggested Next Action:</b> {ev.recommended_action}
+                    </div>
                 </div>
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
             # Alert Actions
             act_c1, act_c2, act_c3 = st.columns([2, 2, 6])
             with act_c1:
                 if not ev.read:
                     if st.button("Mark as Read", key=f"read_{ev.event_id}"):
-                        service.storage.mark_event_read(ev.event_id, True)
+                        service.storage.mark_event_read(ev.event_id, True, owner_id=current_user)
                         st.rerun()
                 else:
                     if st.button("Mark as Unread", key=f"unread_{ev.event_id}"):
-                        service.storage.mark_event_read(ev.event_id, False)
+                        service.storage.mark_event_read(ev.event_id, False, owner_id=current_user)
                         st.rerun()
             with act_c2:
                 if st.button("Dismiss Alert", key=f"dism_{ev.event_id}"):
-                    service.storage.dismiss_event(ev.event_id)
+                    service.storage.dismiss_event(ev.event_id, owner_id=current_user)
                     st.rerun()
 
             st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
@@ -829,19 +870,19 @@ elif page == "Demo Scenarios":
     """)
 
     for sc_id, sc in DEMO_SCENARIOS.items():
-        st.markdown(f"""
+        st.html(f"""
         <div class="nowaware-card">
             <h4>{sc['title']}</h4>
             <p style="color: #94a3b8; font-size: 14px;">{sc['description']}</p>
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
         c_run, c_desc = st.columns([1.5, 4.5])
         with c_run:
             if st.button(f"Execute {sc_id.upper()} ⚡", key=f"run_{sc_id}", type="primary"):
                 with st.spinner("Executing scenario..."):
-                    # Find or create corresponding rule
-                    rules = service.storage.list_rules()
+                    # Find or create corresponding rule for current_user
+                    rules = service.storage.list_rules(owner_id=current_user)
                     target_rule = None
                     for r in rules:
                         if r.source_url == sc["sample_url"]:
@@ -859,22 +900,23 @@ elif page == "Demo Scenarios":
                             specific_instructions=tmpl.get("specific_instructions", ""),
                             check_interval_minutes=tmpl["check_interval_minutes"],
                             is_demo_rule=True,
+                            owner_id=current_user,
                         )
                         service.storage.save_rule(target_rule)
-                        service.establish_baseline(target_rule)
+                        service.establish_baseline(target_rule, owner_id=current_user)
 
                     if sc_id == "scenario_4":
-                        # Source unavailable
-                        service.fetcher.register_mock_source(target_rule.source_url, "")
-                        has_changed, ev, msg = service.check_rule(target_rule.id, simulated_content=None)
+                        # Source unavailable: set to None for 503 outage simulation
+                        service.fetcher.register_mock_source(target_rule.source_url, None)
+                        has_changed, ev, msg = service.check_rule(target_rule.id, simulated_content=None, owner_id=current_user)
                         st.warning(f"Result: {msg}. Baseline was safely preserved!")
                     elif sc_id == "scenario_5":
                         # Duplicate check: run twice with same content
-                        service.check_rule(target_rule.id, simulated_content=sc["updated_content"])
-                        has_changed, ev, msg = service.check_rule(target_rule.id, simulated_content=sc["updated_content"])
+                        service.check_rule(target_rule.id, simulated_content=sc["updated_content"], owner_id=current_user)
+                        has_changed, ev, msg = service.check_rule(target_rule.id, simulated_content=sc["updated_content"], owner_id=current_user)
                         st.info(f"Result: {msg}. Duplicate notifications successfully prevented!")
                     else:
-                        has_changed, ev, msg = service.check_rule(target_rule.id, simulated_content=sc["updated_content"])
+                        has_changed, ev, msg = service.check_rule(target_rule.id, simulated_content=sc["updated_content"], owner_id=current_user)
                         if ev:
                             st.success(f"Result: Classified as {ev.classification.value.upper()}. Alert created: '{ev.summary}'")
                         else:

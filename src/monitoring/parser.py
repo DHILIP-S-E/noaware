@@ -47,10 +47,17 @@ class SourceParser:
         for tag in soup.find_all(unwanted_tags):
             tag.decompose()
 
-        # Also strip elements commonly marked as cookies, banners, or ads
-        for noise_elem in soup.find_all(
-            class_=lambda c: c and any(w in c.lower() for w in ["cookie", "banner", "advert", "sidebar", "popup"])
-        ):
+        # Also strip elements commonly marked as cookies, banners, sponsored content, or ads
+        def _is_noise_attr(val):
+            if not val:
+                return False
+            val_str = " ".join(val).lower() if isinstance(val, (list, tuple)) else str(val).lower()
+            return any(w in val_str for w in ["cookie", "banner", "advert", "sponsored", "sidebar", "popup", "promo"])
+
+        for noise_elem in soup.find_all(class_=_is_noise_attr):
+            noise_elem.decompose()
+
+        for noise_elem in soup.find_all(id=_is_noise_attr):
             noise_elem.decompose()
 
         # Extract headings and paragraphs in natural reading order

@@ -1,0 +1,5 @@
+-r requirements.txt
+streamlit>=1.35.0
+strands-agents>=1.30.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
